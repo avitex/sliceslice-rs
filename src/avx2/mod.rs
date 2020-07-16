@@ -6,31 +6,6 @@ pub use self::{original::*, rust::*};
 use crate::{bits, memchr::MemchrSearcher, memcmp};
 use std::{arch::x86_64::*, mem};
 
-#[derive(Clone, Copy, Default, PartialEq)]
-struct ScalarHash(usize);
-
-impl From<&[u8]> for ScalarHash {
-    #[inline]
-    fn from(bytes: &[u8]) -> Self {
-        bytes.iter().fold(Default::default(), |mut hash, &b| {
-            hash.push(b);
-            hash
-        })
-    }
-}
-
-impl ScalarHash {
-    #[inline]
-    fn push(&mut self, b: u8) {
-        self.0 ^= usize::from(b);
-    }
-
-    #[inline]
-    fn pop(&mut self, b: u8) {
-        self.0 ^= usize::from(b);
-    }
-}
-
 trait Vector: Copy {
     unsafe fn set1_epi8(a: i8) -> Self;
 
@@ -150,7 +125,6 @@ macro_rules! avx2_searcher {
         pub struct $name {
             needle: Box<[u8]>,
             position: usize,
-            scalar_hash: ScalarHash,
             swar_hash: VectorHash<u64>,
             sse2_hash: VectorHash<__m128i>,
             avx2_hash: VectorHash<__m256i>,
@@ -166,7 +140,6 @@ macro_rules! avx2_searcher {
                 assert!(!needle.is_empty());
                 assert!(position < needle.len());
 
-                let scalar_hash = ScalarHash::from(needle.as_ref());
                 let swar_hash = VectorHash::new(needle[0], needle[position]);
                 let sse2_hash = VectorHash::new(needle[0], needle[position]);
                 let avx2_hash = VectorHash::new(needle[0], needle[position]);
@@ -174,7 +147,6 @@ macro_rules! avx2_searcher {
                 Self {
                     needle,
                     position,
-                    scalar_hash,
                     swar_hash,
                     sse2_hash,
                     avx2_hash,
@@ -191,22 +163,44 @@ macro_rules! avx2_searcher {
             }
 
             #[inline]
-            fn scalar_search_in(&self, haystack: &[u8]) -> bool {
+            fn swar_search_in(&self, haystack: &[u8]) -> bool {
                 debug_assert!(haystack.len() >= self.size());
 
-                let mut end = self.size() - 1;
-                let mut hash = ScalarHash::from(&haystack[..end]);
+                if haystack.len() == self.size() {
+                    return unsafe { $memcmp(haystack, &self.needle) };
+                }
 
-                while end < haystack.len() {
-                    hash.push(*unsafe { haystack.get_unchecked(end) });
-                    end += 1;
+                let end = haystack.len() - self.size() + 1;
+                let mask = (1 << end) - 1;
 
-                    let start = end - self.size();
-                    if hash == self.scalar_hash && haystack[start..end] == *self.needle {
+                const LANES: usize = mem::size_of::<u64>();
+                debug_assert!(end < LANES);
+
+                let mut first = 0;
+                unsafe {
+                    let first = &mut *(&mut first as *mut _ as *mut [u8; LANES]);
+                    first[..end].copy_from_slice(&haystack[..end]);
+                }
+
+                let mut last = 0;
+                unsafe {
+                    let last = &mut *(&mut last as *mut _ as *mut [u8; LANES]);
+                    last[..end].copy_from_slice(&haystack[self.position..][..end]);
+                }
+
+                let eq_first = unsafe { Vector::cmpeq_epi8(self.swar_hash.first, first) };
+                let eq_last = unsafe { Vector::cmpeq_epi8(self.swar_hash.last, last) };
+
+                let eq = unsafe { Vector::and_si(eq_first, eq_last) };
+                let mut eq = (unsafe { Vector::movemask_epi8(eq) } & mask) as u32;
+
+                while eq != 0 {
+                    let chunk = &haystack[eq.trailing_zeros() as usize..];
+                    if unsafe { $memcmp(&chunk[1..self.size()], &self.needle[1..]) } {
                         return true;
                     }
 
-                    hash.pop(*unsafe { haystack.get_unchecked(start) });
+                    eq = bits::clear_leftmost_set(eq);
                 }
 
                 false
@@ -276,11 +270,6 @@ macro_rules! avx2_searcher {
                 }
 
                 false
-            }
-
-            #[inline]
-            fn swar_search_in(&self, haystack: &[u8]) -> bool {
-                self.vector_search_in(haystack, &self.swar_hash, Self::scalar_search_in)
             }
 
             #[inline]
