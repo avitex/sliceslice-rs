@@ -43,6 +43,40 @@ trait Vector: Copy {
     unsafe fn movemask_epi8(a: Self) -> i32;
 }
 
+impl Vector for u64 {
+    #[inline]
+    unsafe fn set1_epi8(a: i8) -> Self {
+        u64::from_ne_bytes([a as u8; mem::size_of::<Self>()])
+    }
+
+    #[inline]
+    unsafe fn loadu_si(a: *const Self) -> Self {
+        *a
+    }
+
+    #[inline]
+    unsafe fn cmpeq_epi8(a: Self, b: Self) -> Self {
+        a ^ b
+    }
+
+    #[inline]
+    unsafe fn and_si(a: Self, b: Self) -> Self {
+        a | b
+    }
+
+    #[inline]
+    unsafe fn movemask_epi8(a: Self) -> i32 {
+        let a = a.to_ne_bytes();
+
+        let mut b = 0;
+        for (i, &a) in a.iter().enumerate() {
+            b |= ((a == 0) as i32) << i;
+        }
+
+        b
+    }
+}
+
 impl Vector for __m128i {
     #[inline]
     unsafe fn set1_epi8(a: i8) -> Self {
@@ -117,6 +151,7 @@ macro_rules! avx2_searcher {
             needle: Box<[u8]>,
             position: usize,
             scalar_hash: ScalarHash,
+            swar_hash: VectorHash<u64>,
             sse2_hash: VectorHash<__m128i>,
             avx2_hash: VectorHash<__m256i>,
         }
@@ -132,6 +167,7 @@ macro_rules! avx2_searcher {
                 assert!(position < needle.len());
 
                 let scalar_hash = ScalarHash::from(needle.as_ref());
+                let swar_hash = VectorHash::new(needle[0], needle[position]);
                 let sse2_hash = VectorHash::new(needle[0], needle[position]);
                 let avx2_hash = VectorHash::new(needle[0], needle[position]);
 
@@ -139,6 +175,7 @@ macro_rules! avx2_searcher {
                     needle,
                     position,
                     scalar_hash,
+                    swar_hash,
                     sse2_hash,
                     avx2_hash,
                 }
@@ -242,8 +279,13 @@ macro_rules! avx2_searcher {
             }
 
             #[inline]
+            fn swar_search_in(&self, haystack: &[u8]) -> bool {
+                self.vector_search_in(haystack, &self.swar_hash, Self::scalar_search_in)
+            }
+
+            #[inline]
             fn sse2_search_in(&self, haystack: &[u8]) -> bool {
-                self.vector_search_in(haystack, &self.sse2_hash, Self::scalar_search_in)
+                self.vector_search_in(haystack, &self.sse2_hash, Self::swar_search_in)
             }
 
             #[inline]
